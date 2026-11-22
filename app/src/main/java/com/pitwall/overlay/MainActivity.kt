@@ -1,9 +1,11 @@
 package com.pitwall.overlay
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,8 +17,13 @@ import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
+
+    private lateinit var projectionManager: MediaProjectionManager
+    private val REQ_MEDIA_PROJECTION = 202
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
@@ -30,15 +37,15 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "PITWALL // FLOATING HUD"
-            textSize = 22f
+            text = "PITWALL // AUTO-VISION HUD"
+            textSize = 21f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#E10600"))
             gravity = Gravity.CENTER
         }
 
         val desc = TextView(this).apply {
-            text = "เปิดหน้าต่างลอยทับบนหน้าจอเกม Monoposto\nสามารถลากย้ายมุมจอ และย่อเป็นปุ่มเล็กได้"
+            text = "ระบบสแกนหน้าจอเกมอัตโนมัติ (OCR)\nอ่านเลขรอบ (LAP) และแจ้งเตือนเข้าพิทด้วยเสียงโดยไม่ต้องกดเอง"
             textSize = 14f
             setTextColor(Color.parseColor("#B0B5C0"))
             gravity = Gravity.CENTER
@@ -46,7 +53,7 @@ class MainActivity : Activity() {
         }
 
         val btnStart = Button(this).apply {
-            text = "🚀 เปิดหน้าต่างลอย (LAUNCH HUD)"
+            text = "👁️ เปิดระบบอ่านหน้าจอ + HUD"
             setBackgroundColor(Color.parseColor("#E10600"))
             setTextColor(Color.WHITE)
             setTypeface(null, Typeface.BOLD)
@@ -54,13 +61,9 @@ class MainActivity : Activity() {
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     Toast.makeText(this@MainActivity, "กรุณาอนุญาตสิทธิ์ 'แสดงทับแอปอื่น'", Toast.LENGTH_LONG).show()
-                    val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-                    startActivity(intent)
+                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                 } else {
-                    val svc = Intent(this@MainActivity, OverlayService::class.java)
-                    startForegroundService(svc)
-                    Toast.makeText(this@MainActivity, "เปิด Pitwall HUD แล้ว! เข้าเกมได้เลย", Toast.LENGTH_SHORT).show()
-                    moveTaskToBack(true)
+                    startActivityForResult(projectionManager.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
                 }
             }
         }
@@ -84,5 +87,20 @@ class MainActivity : Activity() {
         root.addView(btnStart)
         root.addView(btnStop)
         setContentView(root)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_MEDIA_PROJECTION && resultCode == RESULT_OK && data != null) {
+            val svc = Intent(this, OverlayService::class.java).apply {
+                putExtra("RESULT_CODE", resultCode)
+                putExtra("DATA", data)
+            }
+            startForegroundService(svc)
+            Toast.makeText(this, "เปิดระบบสแกนหน้าจอแล้ว! เข้าเกม Monoposto ได้เลย", Toast.LENGTH_SHORT).show()
+            moveTaskToBack(true)
+        } else {
+            Toast.makeText(this, "จำเป็นต้องกด 'เริ่มเลย' เพื่ออนุญาตให้อ่านหน้าจอเกม", Toast.LENGTH_LONG).show()
+        }
     }
 }
