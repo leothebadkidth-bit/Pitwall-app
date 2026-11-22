@@ -7,9 +7,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
@@ -43,6 +46,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     private lateinit var expandedPanel: LinearLayout
     private lateinit var miniBubble: TextView
     private lateinit var telemetryTxt: TextView
+    private lateinit var subTelemetryTxt: TextView
     private lateinit var radioTxt: TextView
     private lateinit var scanStatusTxt: TextView
 
@@ -53,12 +57,19 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val handler = Handler(Looper.getMainLooper())
 
+    // สถานะการแข่งจาก Monoposto
+    private var driverTag = "MAI"
     private var currentLap = 1
     private var totalLaps = 0
+    private var currentPos = "--"
+    private var tireTemp = "--"
+    private var bestLapTime = "--:--.---"
+    private var isSafetyCar = false
     private var tireWear = 100
     private var compound = "SOFT"
     private var mode = "BAL"
     private var boxQueued = false
+
     private var isScanning = false
     private var isProcessingFrame = false
 
@@ -87,16 +98,23 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
                 mediaProjection = mgr.getMediaProjection(resultCode, data)
                 startScreenCapture()
             } catch (e: Exception) {
-                radioTxt.text = "⚠️ กล้องสแกนขัดข้อง: ใช้โหมดกดมือได้"
+                radioTxt.text = "⚠️ กล้องสแกนขัดข้อง: ใช้ปุ่ม +1 แทนได้"
             }
         }
         return START_NOT_STICKY
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (isScanning && mediaProjection != null) {
+            handler.postDelayed({ setupVirtualDisplay() }, 350)
+        }
+    }
+
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale.US
-            speak("Auto vision online. Ready for race.")
+            speak("Monoposto telemetry linked. Ready for lights out.")
         }
     }
 
@@ -109,8 +127,8 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         val channel = NotificationChannel(channelId, "Pitwall Vision HUD", NotificationManager.IMPORTANCE_LOW)
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         val notif = android.app.Notification.Builder(this, channelId)
-            .setContentTitle("Pitwall Auto-Vision Active")
-            .setContentText("กำลังสแกนค่าจากหน้าจอเกมอัตโนมัติ")
+            .setContentTitle("Pitwall Monoposto Telemetry")
+            .setContentText("กำลังอ่านค่าจากหน้าจอ Monoposto")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .build()
 
@@ -124,7 +142,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     private fun startScreenCapture() {
         val projection = mediaProjection ?: return
 
-        // บังคับลงทะเบียน Callback ก่อนสร้าง VirtualDisplay สำหรับ Android 14+
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 super.onStop()
@@ -139,11 +156,23 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             }
         }, handler)
 
+        setupVirtualDisplay()
+        isScanning = true
+        scanStatusTxt.text = "👁️ MONOPOSTO SYNC  "
+        scanStatusTxt.setTextColor(Color.parseColor("#00D2BE"))
+        scheduleNextScan()
+    }
+
+    private fun setupVirtualDisplay() {
+        val projection = mediaProjection ?: return
+        virtualDisplay?.release()
+        imageReader?.close()
+
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val width = (metrics.widthPixels / 2).coerceAtLeast(1)
-        val height = (metrics.heightPixels / 2).coerceAtLeast(1)
+        val width = metrics.widthPixels.coerceAtLeast(1)
+        val height = metrics.heightPixels.coerceAtLeast(1)
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -153,11 +182,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, handler
         )
-
-        isScanning = true
-        scanStatusTxt.text = "👁️ AUTO-SCAN: ON  "
-        scanStatusTxt.setTextColor(Color.parseColor("#00D2BE"))
-        scheduleNextScan()
     }
 
     private fun scheduleNextScan() {
@@ -165,7 +189,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         handler.postDelayed({
             captureAndAnalyze()
             scheduleNextScan()
-        }, 2000)
+        }, 1200)
     }
 
     private fun captureAndAnalyze() {
@@ -180,24 +204,80 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             val rowStride = planes[0].rowStride
             val rowPadding = rowStride - pixelStride * image.width
 
-            val bitmap = Bitmap.createBitmap(
+            val rawBitmap = Bitmap.createBitmap(
                 image.width + rowPadding / pixelStride,
                 image.height,
                 Bitmap.Config.ARGB_8888
             )
-            bitmap.copyPixelsFromBuffer(buffer)
-            val cropped = Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
-            bitmap.recycle()
+            rawBitmap.copyPixelsFromBuffer(buffer)
+            val fullScreen = Bitmap.createBitmap(rawBitmap, 0, 0, image.width, image.height)
+            rawBitmap.recycle()
 
-            val inputImage = InputImage.fromBitmap(cropped, 0)
+            val w = fullScreen.width
+            val h = fullScreen.height
+
+            // รอจนกว่าจะเข้าเกมแนวนอน
+            if (w <= h || w < 400 || h < 200) {
+                fullScreen.recycle()
+                isProcessingFrame = false
+                return
+            }
+
+            // ตัดเฉพาะ 3 โซนข้อมูลของ Monoposto มารวมในภาพเดียวเพื่อความแม่นยำสูงสุด:
+            // โซน 1: หัวตารางซ้ายบน (LAP 1/15, SAFETY CAR) -> ขยาย 2 เท่าให้อ่านตัวเลขห้อยท้ายชัด
+            val headerW = (w * 0.28f).toInt()
+            val headerH = (h * 0.16f).toInt()
+
+            // โซน 2: รายชื่อนักขับฝั่งซ้าย (01..22 + MAI)
+            val towerY = (h * 0.11f).toInt()
+            val towerW = (w * 0.24f).toInt()
+            val towerH = (h * 0.78f).toInt()
+
+            // โซน 3: กล่องเวลาและอุณหภูมิยางฝั่งขวา (BEST TIME, 100°)
+            val rightX = (w * 0.72f).toInt()
+            val rightY = (h * 0.12f).toInt()
+            val rightW = (w * 0.28f).toInt()
+            val rightH = (h * 0.42f).toInt()
+
+            val stitchedW = (headerW * 2) + rightW + 40
+            val stitchedH = maxOf((headerH * 2) + towerH + 40, rightH + 40)
+            val stitched = Bitmap.createBitmap(stitchedW, stitchedH, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(stitched)
+            canvas.drawColor(Color.BLACK)
+
+            // วาดโซน 1 (ขยาย 2x)
+            canvas.drawBitmap(
+                fullScreen,
+                Rect(0, 0, headerW, headerH),
+                Rect(0, 0, headerW * 2, headerH * 2),
+                null
+            )
+            // วาดโซน 2 (รายชื่อนักขับใต้หัวตาราง)
+            canvas.drawBitmap(
+                fullScreen,
+                Rect(0, towerY, towerW, towerY + towerH),
+                Rect(0, (headerH * 2) + 20, towerW, (headerH * 2) + 20 + towerH),
+                null
+            )
+            // วาดโซน 3 (เทเลเมทรีฝั่งขวา)
+            canvas.drawBitmap(
+                fullScreen,
+                Rect(rightX, rightY, rightX + rightW, rightY + rightH),
+                Rect((headerW * 2) + 20, 0, (headerW * 2) + 20 + rightW, rightH),
+                null
+            )
+
+            fullScreen.recycle()
+
+            val inputImage = InputImage.fromBitmap(stitched, 0)
             recognizer.process(inputImage)
                 .addOnSuccessListener { visionText ->
-                    parseGameTelemetry(visionText.text)
-                    cropped.recycle()
+                    parseMonopostoTelemetry(visionText.text)
+                    stitched.recycle()
                     isProcessingFrame = false
                 }
                 .addOnFailureListener {
-                    cropped.recycle()
+                    stitched.recycle()
                     isProcessingFrame = false
                 }
         } catch (e: Exception) {
@@ -207,62 +287,116 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun parseGameTelemetry(rawText: String) {
+    private fun parseMonopostoTelemetry(rawText: String) {
         val upper = rawText.uppercase(Locale.US)
-        val lapMatcher = Pattern.compile("(?:LAP\\s*)?(\\d{1,2})\\s*/\\s*(\\d{1,2})").matcher(upper)
-        if (lapMatcher.find()) {
-            val detectedLap = lapMatcher.group(1)?.toIntOrNull() ?: currentLap
-            val detectedTotal = lapMatcher.group(2)?.toIntOrNull() ?: totalLaps
 
-            if (detectedTotal in 3..78 && detectedLap in 1..detectedTotal) {
-                totalLaps = detectedTotal
-                if (detectedLap > currentLap) {
-                    onNewLapDetected(detectedLap)
-                } else if (detectedLap == 1 && currentLap > 2) {
-                    currentLap = 1
-                    tireWear = 100
-                    boxQueued = false
-                    radioTxt.text = "📻 New race detected! Lights out!"
-                    speak("New race started.")
-                }
-                updateDisplay()
+        // 1. ตรวจจับ Safety Car
+        val scNow = upper.contains("SAFETY CAR")
+        if (scNow && !isSafetyCar) {
+            isSafetyCar = true
+            radioTxt.text = "🟡 SAFETY CAR! โอกาสทองเข้าพิทประหยัดเวลา"
+            speak("Safety car deployed! Good window to box.")
+        } else if (!scNow && isSafetyCar) {
+            isSafetyCar = false
+            radioTxt.text = "🟢 Green flag! Safety car in this lap."
+            speak("Safety car in this lap. Get ready to push.")
+        }
+
+        // 2. อ่านเลขรอบ LAP X/Y (รองรับตัวเลขห้อยท้าย /15, /12)
+        val lapFullMatcher = Pattern.compile("LAP\\s*(\\d{1,2})\\s*[/|\\\\I1]\\s*(\\d{1,2})").matcher(upper)
+        val lapSingleMatcher = Pattern.compile("LAP\\s*(\\d{1,2})\\s*[/|\\\\]").matcher(upper)
+
+        var detectedLap: Int? = null
+        if (lapFullMatcher.find()) {
+            val l = lapFullMatcher.group(1)?.toIntOrNull()
+            val t = lapFullMatcher.group(2)?.toIntOrNull()
+            if (l != null && t != null && t in 3..78 && l in 1..t) {
+                detectedLap = l
+                totalLaps = t
+            }
+        } else if (lapSingleMatcher.find()) {
+            val l = lapSingleMatcher.group(1)?.toIntOrNull()
+            if (l != null && l in 1..78) {
+                detectedLap = l
             }
         }
+
+        if (detectedLap != null) {
+            if (detectedLap > currentLap && (detectedLap - currentLap) <= 3) {
+                onNewLapDetected(detectedLap)
+            } else if (detectedLap == 1 && currentLap > 2) {
+                currentLap = 1
+                tireWear = 100
+                boxQueued = false
+                radioTxt.text = "📻 Lights out! เริ่มแข่งใหม่ยาง 100%"
+                speak("Lights out and away we go!")
+            }
+        }
+
+        // 3. ค้นหาอันดับของรถผู้เล่น (MAI) จากตารางฝั่งซ้าย
+        val posMatcher = Pattern.compile("(\\d{1,2})\\s*$driverTag\\b").matcher(upper)
+        if (posMatcher.find()) {
+            val posNum = posMatcher.group(1)?.toIntOrNull()
+            if (posNum != null && posNum in 1..22) {
+                currentPos = "P$posNum"
+            }
+        }
+
+        // 4. อ่านอุณหภูมิยาง (เช่น 80°, 100°) จากกล่องขวา
+        val tempMatcher = Pattern.compile("(\\d{2,3})\\s*[°º]").matcher(upper)
+        if (tempMatcher.find()) {
+            val tVal = tempMatcher.group(1)?.toIntOrNull()
+            if (tVal != null && tVal in 30..145) {
+                tireTemp = "${tVal}°C"
+            }
+        }
+
+        // 5. อ่าน BEST TIME (เช่น 01:32.044)
+        val timeMatcher = Pattern.compile("BEST\\s*TIME[^0-9]*(\\d{2}:\\d{2}\\.\\d{3})").matcher(upper)
+        if (timeMatcher.find()) {
+            bestLapTime = timeMatcher.group(1) ?: bestLapTime
+        }
+
+        updateDisplay()
     }
 
     private fun onNewLapDetected(newLap: Int) {
         val lapsPassed = (newLap - currentLap).coerceAtLeast(1)
         currentLap = newLap
 
-        val wearPerLap = when (compound) {
+        var wearPerLap = when (compound) {
             "SOFT" -> if (mode == "PUSH") 8 else 6
             "MED" -> if (mode == "PUSH") 6 else 4
             else -> 3
+        }
+        // ช่วง Safety Car ยางสึกน้อยลง 60%
+        if (isSafetyCar) {
+            wearPerLap = (wearPerLap * 0.4).toInt().coerceAtLeast(1)
         }
 
         if (boxQueued) {
             tireWear = 100
             boxQueued = false
             compound = if (compound == "SOFT") "MED" else "HARD"
-            radioTxt.text = "📻 Pit stop done! New $compound"
+            radioTxt.text = "📻 Pit stop done! เปลี่ยนยาง $compound 100%"
             speak("Pit stop complete. Push now.")
         } else {
             tireWear = (tireWear - (wearPerLap * lapsPassed)).coerceAtLeast(0)
             if (tireWear in 22..30) {
-                radioTxt.text = "⚠️ ยางเริ่มหมด ($tireWear%) เตรียมเข้าพิท"
+                radioTxt.text = "⚠️ ยางเหลือ $tireWear% เตรียมเข้าพิท"
                 speak("Tires at $tireWear percent. Consider boxing.")
             } else if (tireWear < 22) {
                 radioTxt.text = "🚨 ยางวิกฤต ($tireWear%) เข้าพิทด่วน!"
                 speak("Critical tire wear! Box this lap!")
             } else {
-                radioTxt.text = "📻 Lap $currentLap synced ($mode)"
+                radioTxt.text = "📻 Lap $currentLap ($currentPos) | จังหวะดีมาก"
             }
         }
     }
 
     private fun updateDisplay() {
         val lapStr = if (totalLaps > 0) "LAP $currentLap/$totalLaps" else "LAP $currentLap"
-        telemetryTxt.text = "$lapStr | TIRE: $tireWear% ($compound)"
+        telemetryTxt.text = "$currentPos | $lapStr | TIRE: $tireWear% ($compound)"
         telemetryTxt.setTextColor(
             when {
                 tireWear <= 25 -> Color.parseColor("#FF3B30")
@@ -270,6 +404,8 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
                 else -> Color.WHITE
             }
         )
+        val scBadge = if (isSafetyCar) "🟡 SC | " else ""
+        subTelemetryTxt.text = "${scBadge}TEMP: $tireTemp | BEST: $bestLapTime"
     }
 
     private fun setupOverlay() {
@@ -282,9 +418,9 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 40
-            y = 140
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = 0
+            y = 16
         }
 
         rootView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -308,10 +444,10 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
 
         expandedPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(22, 16, 22, 16)
+            setPadding(20, 12, 20, 12)
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#DC12141C"))
-                cornerRadius = 24f
+                setColor(Color.parseColor("#D912141C"))
+                cornerRadius = 20f
                 setStroke(2, Color.parseColor("#E10600"))
             }
         }
@@ -343,18 +479,25 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         headerRow.addView(btnMin)
 
         telemetryTxt = TextView(this).apply {
-            text = "LAP 1 | TIRE: 100% (SOFT)"
+            text = "-- | LAP 1 | TIRE: 100% (SOFT)"
             textSize = 12f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
-            setPadding(0, 8, 0, 8)
+            setPadding(0, 6, 0, 2)
+        }
+
+        subTelemetryTxt = TextView(this).apply {
+            text = "TEMP: -- | BEST: --:--.---"
+            textSize = 10f
+            setTextColor(Color.parseColor("#90CAF9"))
+            setPadding(0, 0, 0, 4)
         }
 
         radioTxt = TextView(this).apply {
-            text = "📻 รอสแกนเลขรอบจากหน้าจอเกม..."
+            text = "📻 เข้าแข่งใน Monoposto เพื่อซิงค์ข้อมูล..."
             textSize = 11f
             setTextColor(Color.parseColor("#FFD700"))
-            setPadding(0, 0, 0, 10)
+            setPadding(0, 0, 0, 8)
         }
 
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -380,6 +523,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
                 tireWear = 100
                 compound = "SOFT"
                 boxQueued = false
+                isSafetyCar = false
                 radioTxt.text = "📻 รีเซ็ตเริ่มรอบ 1 ใหม่แล้ว"
                 updateDisplay()
             }
@@ -404,71 +548,4 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         val btnBox = Button(this).apply {
             text = "BOX"
             textSize = 10f
-            setBackgroundColor(Color.parseColor("#00897B"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                boxQueued = !boxQueued
-                if (boxQueued) {
-                    text = "BOX ✅"
-                    radioTxt.text = "📻 Box confirmed this lap!"
-                    speak("Copy, box this lap.")
-                } else {
-                    text = "BOX"
-                    radioTxt.text = "📻 Stay out, stay out."
-                }
-            }
-        }
-
-        btnRow.addView(btnLap)
-        btnRow.addView(btnReset)
-        btnRow.addView(btnMode)
-        btnRow.addView(btnBox)
-
-        expandedPanel.addView(headerRow)
-        expandedPanel.addView(telemetryTxt)
-        expandedPanel.addView(radioTxt)
-        expandedPanel.addView(btnRow)
-
-        rootView.addView(miniBubble)
-        rootView.addView(expandedPanel)
-
-        var initialX = 0
-        var initialY = 0
-        var initialTouchX = 0f
-        var initialTouchY = 0f
-
-        rootView.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialX = params.x
-                    initialY = params.y
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    params.x = initialX + (event.rawX - initialTouchX).toInt()
-                    params.y = initialY + (event.rawY - initialTouchY).toInt()
-                    windowManager.updateViewLayout(rootView, params)
-                    true
-                }
-                else -> false
-            }
-        }
-
-        windowManager.addView(rootView, params)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        isScanning = false
-        handler.removeCallbacksAndMessages(null)
-        virtualDisplay?.release()
-        mediaProjection?.stop()
-        imageReader?.close()
-        tts?.shutdown()
-        if (::rootView.isInitialized) {
-            windowManager.removeView(rootView)
-        }
-    }
-}
+            setBackgro
