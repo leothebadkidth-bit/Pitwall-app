@@ -57,7 +57,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val handler = Handler(Looper.getMainLooper())
 
-    // สถานะการแข่งจาก Monoposto
     private var driverTag = "MAI"
     private var currentLap = 1
     private var totalLaps = 0
@@ -216,24 +215,17 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             val w = fullScreen.width
             val h = fullScreen.height
 
-            // รอจนกว่าจะเข้าเกมแนวนอน
             if (w <= h || w < 400 || h < 200) {
                 fullScreen.recycle()
                 isProcessingFrame = false
                 return
             }
 
-            // ตัดเฉพาะ 3 โซนข้อมูลของ Monoposto มารวมในภาพเดียวเพื่อความแม่นยำสูงสุด:
-            // โซน 1: หัวตารางซ้ายบน (LAP 1/15, SAFETY CAR) -> ขยาย 2 เท่าให้อ่านตัวเลขห้อยท้ายชัด
             val headerW = (w * 0.28f).toInt()
             val headerH = (h * 0.16f).toInt()
-
-            // โซน 2: รายชื่อนักขับฝั่งซ้าย (01..22 + MAI)
             val towerY = (h * 0.11f).toInt()
             val towerW = (w * 0.24f).toInt()
             val towerH = (h * 0.78f).toInt()
-
-            // โซน 3: กล่องเวลาและอุณหภูมิยางฝั่งขวา (BEST TIME, 100°)
             val rightX = (w * 0.72f).toInt()
             val rightY = (h * 0.12f).toInt()
             val rightW = (w * 0.28f).toInt()
@@ -245,27 +237,9 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             val canvas = Canvas(stitched)
             canvas.drawColor(Color.BLACK)
 
-            // วาดโซน 1 (ขยาย 2x)
-            canvas.drawBitmap(
-                fullScreen,
-                Rect(0, 0, headerW, headerH),
-                Rect(0, 0, headerW * 2, headerH * 2),
-                null
-            )
-            // วาดโซน 2 (รายชื่อนักขับใต้หัวตาราง)
-            canvas.drawBitmap(
-                fullScreen,
-                Rect(0, towerY, towerW, towerY + towerH),
-                Rect(0, (headerH * 2) + 20, towerW, (headerH * 2) + 20 + towerH),
-                null
-            )
-            // วาดโซน 3 (เทเลเมทรีฝั่งขวา)
-            canvas.drawBitmap(
-                fullScreen,
-                Rect(rightX, rightY, rightX + rightW, rightY + rightH),
-                Rect((headerW * 2) + 20, 0, (headerW * 2) + 20 + rightW, rightH),
-                null
-            )
+            canvas.drawBitmap(fullScreen, Rect(0, 0, headerW, headerH), Rect(0, 0, headerW * 2, headerH * 2), null)
+            canvas.drawBitmap(fullScreen, Rect(0, towerY, towerW, towerY + towerH), Rect(0, (headerH * 2) + 20, towerW, (headerH * 2) + 20 + towerH), null)
+            canvas.drawBitmap(fullScreen, Rect(rightX, rightY, rightX + rightW, rightY + rightH), Rect((headerW * 2) + 20, 0, (headerW * 2) + 20 + rightW, rightH), null)
 
             fullScreen.recycle()
 
@@ -290,7 +264,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     private fun parseMonopostoTelemetry(rawText: String) {
         val upper = rawText.uppercase(Locale.US)
 
-        // 1. ตรวจจับ Safety Car
         val scNow = upper.contains("SAFETY CAR")
         if (scNow && !isSafetyCar) {
             isSafetyCar = true
@@ -302,7 +275,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             speak("Safety car in this lap. Get ready to push.")
         }
 
-        // 2. อ่านเลขรอบ LAP X/Y (รองรับตัวเลขห้อยท้าย /15, /12)
         val lapFullMatcher = Pattern.compile("LAP\\s*(\\d{1,2})\\s*[/|\\\\I1]\\s*(\\d{1,2})").matcher(upper)
         val lapSingleMatcher = Pattern.compile("LAP\\s*(\\d{1,2})\\s*[/|\\\\]").matcher(upper)
 
@@ -333,7 +305,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
-        // 3. ค้นหาอันดับของรถผู้เล่น (MAI) จากตารางฝั่งซ้าย
         val posMatcher = Pattern.compile("(\\d{1,2})\\s*$driverTag\\b").matcher(upper)
         if (posMatcher.find()) {
             val posNum = posMatcher.group(1)?.toIntOrNull()
@@ -342,7 +313,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
-        // 4. อ่านอุณหภูมิยาง (เช่น 80°, 100°) จากกล่องขวา
         val tempMatcher = Pattern.compile("(\\d{2,3})\\s*[°º]").matcher(upper)
         if (tempMatcher.find()) {
             val tVal = tempMatcher.group(1)?.toIntOrNull()
@@ -351,7 +321,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
-        // 5. อ่าน BEST TIME (เช่น 01:32.044)
         val timeMatcher = Pattern.compile("BEST\\s*TIME[^0-9]*(\\d{2}:\\d{2}\\.\\d{3})").matcher(upper)
         if (timeMatcher.find()) {
             bestLapTime = timeMatcher.group(1) ?: bestLapTime
@@ -369,7 +338,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             "MED" -> if (mode == "PUSH") 6 else 4
             else -> 3
         }
-        // ช่วง Safety Car ยางสึกน้อยลง 60%
         if (isSafetyCar) {
             wearPerLap = (wearPerLap * 0.4).toInt().coerceAtLeast(1)
         }
@@ -548,4 +516,38 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         val btnBox = Button(this).apply {
             text = "BOX"
             textSize = 10f
-            setBackgro
+            setBackgroundColor(Color.parseColor("#00897B"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                boxQueued = !boxQueued
+                if (boxQueued) {
+                    text = "BOX ✅"
+                    radioTxt.text = "📻 Box confirmed this lap!"
+                    speak("Copy, box this lap.")
+                } else {
+                    text = "BOX"
+                    radioTxt.text = "📻 Stay out, stay out."
+                }
+            }
+        }
+
+        btnRow.addView(btnLap)
+        btnRow.addView(btnReset)
+        btnRow.addView(btnMode)
+        btnRow.addView(btnBox)
+
+        expandedPanel.addView(headerRow)
+        expandedPanel.addView(telemetryTxt)
+        expandedPanel.addView(subTelemetryTxt)
+        expandedPanel.addView(radioTxt)
+        expandedPanel.addView(btnRow)
+
+        rootView.addView(miniBubble)
+        rootView.addView(expandedPanel)
+
+        var initialX = 0
+        var initialY = 0
+        var initialTouchX = 0f
+        var initialTouchY = 0f
+
+        rootView.setOnTouchListener { 
