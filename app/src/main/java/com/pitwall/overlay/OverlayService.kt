@@ -60,17 +60,19 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     private var mode = "BAL"
     private var boxQueued = false
     private var isScanning = false
+    private var isProcessingFrame = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundNotif()
         tts = TextToSpeech(this, this)
         setupOverlay()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForegroundNotif()
+
         val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent?.getParcelableExtra("DATA", Intent::class.java)
@@ -80,9 +82,13 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         }
 
         if (resultCode == Activity.RESULT_OK && data != null && mediaProjection == null) {
-            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = mgr.getMediaProjection(resultCode, data)
-            startScreenCapture()
+            try {
+                val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjection = mgr.getMediaProjection(resultCode, data)
+                startScreenCapture()
+            } catch (e: Exception) {
+                radioTxt.text = "⚠️ กล้องสแกนขัดข้อง: ใช้โหมดกดมือได้"
+            }
         }
         return START_NOT_STICKY
     }
@@ -90,7 +96,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale.US
-            speak("Auto vision online. Monitoring screen.")
+            speak("Auto vision online. Ready for race.")
         }
     }
 
@@ -116,24 +122,40 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun startScreenCapture() {
+        val projection = mediaProjection ?: return
+
+        // บังคับลงทะเบียน Callback ก่อนสร้าง VirtualDisplay สำหรับ Android 14+
+        projection.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                super.onStop()
+                isScanning = false
+                handler.removeCallbacksAndMessages(null)
+                virtualDisplay?.release()
+                imageReader?.close()
+                if (::scanStatusTxt.isInitialized) {
+                    scanStatusTxt.text = "👁️ SCAN: OFF  "
+                    scanStatusTxt.setTextColor(Color.LTGRAY)
+                }
+            }
+        }, handler)
+
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        // Downscale by 2 for fast OCR performance
-        val width = metrics.widthPixels / 2
-        val height = metrics.heightPixels / 2
+        val width = (metrics.widthPixels / 2).coerceAtLeast(1)
+        val height = (metrics.heightPixels / 2).coerceAtLeast(1)
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
+        virtualDisplay = projection.createVirtualDisplay(
             "PitwallCapture",
             width, height, density,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, null
+            imageReader?.surface, null, handler
         )
 
         isScanning = true
-        scanStatusTxt.text = "👁️ AUTO-SCAN: ON"
+        scanStatusTxt.text = "👁️ AUTO-SCAN: ON  "
         scanStatusTxt.setTextColor(Color.parseColor("#00D2BE"))
         scheduleNextScan()
     }
@@ -143,11 +165,14 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         handler.postDelayed({
             captureAndAnalyze()
             scheduleNextScan()
-        }, 2000) // Scan every 2 seconds
+        }, 2000)
     }
 
     private fun captureAndAnalyze() {
+        if (isProcessingFrame) return
         val image = imageReader?.acquireLatestImage() ?: return
+        isProcessingFrame = true
+
         try {
             val planes = image.planes
             val buffer = planes[0].buffer
@@ -169,12 +194,14 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
                 .addOnSuccessListener { visionText ->
                     parseGameTelemetry(visionText.text)
                     cropped.recycle()
+                    isProcessingFrame = false
                 }
                 .addOnFailureListener {
                     cropped.recycle()
+                    isProcessingFrame = false
                 }
         } catch (e: Exception) {
-            // Ignore frame drop
+            isProcessingFrame = false
         } finally {
             image.close()
         }
@@ -182,7 +209,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
 
     private fun parseGameTelemetry(rawText: String) {
         val upper = rawText.uppercase(Locale.US)
-        // Look for Lap pattern like "1/25", "LAP 3/20", "3 / 15"
         val lapMatcher = Pattern.compile("(?:LAP\\s*)?(\\d{1,2})\\s*/\\s*(\\d{1,2})").matcher(upper)
         if (lapMatcher.find()) {
             val detectedLap = lapMatcher.group(1)?.toIntOrNull() ?: currentLap
@@ -193,7 +219,6 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
                 if (detectedLap > currentLap) {
                     onNewLapDetected(detectedLap)
                 } else if (detectedLap == 1 && currentLap > 2) {
-                    // New race restarted
                     currentLap = 1
                     tireWear = 100
                     boxQueued = false
@@ -334,6 +359,17 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
 
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
+        val btnLap = Button(this).apply {
+            text = "+1"
+            textSize = 10f
+            setBackgroundColor(Color.parseColor("#E10600"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                onNewLapDetected(currentLap + 1)
+                updateDisplay()
+            }
+        }
+
         val btnReset = Button(this).apply {
             text = "RESET"
             textSize = 10f
@@ -350,7 +386,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
         }
 
         val btnMode = Button(this).apply {
-            text = "MODE: BAL"
+            text = "BAL"
             textSize = 10f
             setBackgroundColor(Color.parseColor("#252836"))
             setTextColor(Color.WHITE)
@@ -360,7 +396,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
                     "PUSH" -> "SAVE"
                     else -> "BAL"
                 }
-                text = "MODE: $mode"
+                text = mode
                 radioTxt.text = "📻 Engine mode: $mode"
             }
         }
@@ -383,6 +419,7 @@ class OverlayService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
+        btnRow.addView(btnLap)
         btnRow.addView(btnReset)
         btnRow.addView(btnMode)
         btnRow.addView(btnBox)
